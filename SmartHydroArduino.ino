@@ -55,6 +55,8 @@ const unsigned long FOUR_HR = 14400000;
 const unsigned long FIVE_MIN = 300000; // FIVE_MIN
 const unsigned long valueOff = 28500000; 
 
+const  float MAX_LIGHT_READING_LUX = 1023;
+const  float MINIMIM_LIGHT_PERCENTAGE = 10.0 / 100.0;
 DFRobot_EC10 ec;
 auto timer = timer_create_default();
 float temperature;
@@ -67,10 +69,10 @@ volatile int pulseCount = 0;
 unsigned long currentTime, cloopTime;
 
 void setup() {
-  Serial.begin(9600);
-  Serial1.begin(115200);
-  WiFi.init(&Serial1);  // Initialize ESP module using Serial1
-
+ Serial.begin(115200);
+  Serial1.begin(9600); // for esp32
+  Serial2.begin(115200);
+ WiFi.init(&Serial2); 
   pinMode(PUMP_PIN, OUTPUT);
 digitalWrite(PUMP_PIN, HIGH);    // initially setting it off
   timer.in(0,timeOnPump);  // THESE TIMES ARE TO SCHEDULE FOR WHEN TIME OFF WILL TAKE PLACE
@@ -123,7 +125,31 @@ for (int i = 3; i < 13; i++) {    //This will initially set everything to off ex
   timer.every(5000, estimateHumidity);
   timer.every(SIXTEEN_HR, estimateEC);
   timer.every(SIXTEEN_HR, estimatePH);
+ timer.every(1000, [](){
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    ecLevel = getEC();
+    phLevel = getPH();
+     flowRate = getFlowRate();
+     lightLevel = getLightLevel();
+});
+timer.every(5000, []() {
+ 
+  String message = "{";
+  
+  message += "\"PH\":\"" + String(isnan(phLevel) ? 0.0 : phLevel, 2) + "\",";        
+  message += "\"Light\":\"" + String(isnan(lightLevel) ? 0.0 : lightLevel, 2) + "\",";  
+  message += "\"EC\":\"" + String(isnan(ecLevel) ? 0.0 : ecLevel, 2) + "\",";        
+  message += "\"FlowRate\":\"" + String(isnan(flowRate) ? 0.0 : flowRate, 2) + "\","; 
+  message += "\"Humidity\":\"" + String(isnan(humidity) ? 0.0 : humidity, 2) + "\","; 
+  message += "\"Temperature\":\"" + String(isnan(temperature) ? 0.0 : temperature, 2) + "\"";
 
+  message += "}";
+   Serial1.print('<');
+  Serial1.print(message);
+  Serial1.print('>');
+      
+  });
  // toggleLightOn();   MAY NEED TO CODE THIS BACK IN
 }
 
@@ -131,16 +157,9 @@ for (int i = 3; i < 13; i++) {    //This will initially set everything to off ex
 void loop() {
   
   WiFiEspClient client = server.available();  // Check if a client has connected
-
-  temperature = dht.readTemperature();
-  humidity = dht.readHumidity();
-  lightLevel = getLightLevel();
-  ecLevel = getEC();
-  phLevel = getPH();
-  flowRate = getFlowRate();
-
+ checkLightLevelBelow();
   timer.tick();
-
+  readRemoteToggle();
   if (client) {  // If a client is available
     buf.init();
     message = "";
@@ -152,9 +171,8 @@ void loop() {
         // you got two newline characters in a row
         // that's the end of the HTTP request, so send a response
         if (buf.endsWith("\r\n\r\n")) {
-          message = "{\n  \"PH\": \"" + String(phLevel) + "\",\n \"Light\": \"" + String(lightLevel) +  "\",\n  \"EC\": \"" + String(ecLevel) + "\",\n  \"FlowRate\": \"" + String(flowRate) + "\",\n  \"Humidity\": \"" + String(humidity) + "\",\n  \"Temperature\": \"" + String(temperature) +  "\"\n }"; 
-          ec.calibration(ecLevel, temperature); 
-
+         message = "{\n  \"PH\": \"" + String(phLevel, 2) + "\",\n \"Light\": \"" + String(lightLevel) + "\",\n  \"EC\": \"" + String(ecLevel, 2) + "\",\n  \"FlowRate\": \"" + String(flowRate) + "\",\n  \"Humidity\": \"" + String(humidity) + "\",\n  \"Temperature\": \"" + String(temperature) + "\"\n }";
+         
           sendHttpResponse(client, message);
           break;
         }
@@ -407,6 +425,117 @@ void toggleLightOn() {
 void toggleLightOff() {
   togglePin(LED_PIN, HIGH);
   timer.in(FOUR_HR, toggleLightOn);
+}
+ bool checkLightLevelBelow() {
+    float currentLightLevel = getLightLevel();
+    bool lowSunlightLevel = currentLightLevel <= MAX_LIGHT_READING_LUX * MINIMIM_LIGHT_PERCENTAGE;
+
+  if (lowSunlightLevel) {
+      toggleLightOn();
+    }
+    else {
+      toggleLightOff();
+    }
+   
+  }
+
+/* this will read data from the esp32 via the rx/tx wires
+* 1 means toggle, 0 means the state stays as is
+*/
+ void readRemoteToggle() {
+  static bool inFrame = false;
+  static uint8_t index = 0;
+  char c;
+  
+  while (Serial1.available()) {
+
+    c = Serial1.read();
+    Serial.println(c);
+    Serial.println("We are here");
+    if (c == '<') {
+      Serial.println("We found <");
+      inFrame = true;
+      index = 0;
+      continue;
+    } 
+    else if (c == '>') {
+      Serial.println("closing off");
+      serialBuf[index] = '\0';
+      inFrame = false;
+      
+      // Only process if JSON looks complete
+      if (strchr(serialBuf, '{') && strchr(serialBuf, '}')) {
+        processToggle(serialBuf);
+      } else {
+        Serial.println("⚠️ Incomplete JSON received, ignoring");
+      }
+
+      index = 0;
+      continue;
+    }
+
+    if (inFrame && index < SERIAL_BUF_SIZE - 1) {
+      serialBuf[index++] = c;
+    }
+  }
+}
+
+void processToggle(char* data) {
+  String s = String(data);
+  Serial.println(data);
+   if (s.indexOf("\"Light\":1") >= 0) togglePin(LED_PIN);
+  
+  // Fan
+  if (s.indexOf("\"Fan\":1") >= 0) togglePin(FAN_PIN);
+  
+  // Extractor Fan
+  if (s.indexOf("\"ExtractorFan\":1") >= 0) togglePin(EXTRACTOR_PIN);
+  
+  // Pump
+  if (s.indexOf("\"Pump\":1") >= 0){
+     togglePin(PUMP_PIN);
+      
+  }
+
+   if (s.indexOf("\"PHUp\":1") >= 0) {
+  togglePin(PH_DOWN_PIN, LOW);
+  togglePin(PH_UP_PIN, HIGH);
+  timer.in(PUMP_INTERVAL, disablePH);
+}
+
+if (s.indexOf("\"PHDown\":1") >= 0) {
+  togglePin(PH_UP_PIN, LOW);
+  togglePin(PH_DOWN_PIN, HIGH);
+  timer.in(PUMP_INTERVAL, disablePH);
+}
+
+if (s.indexOf("\"ECUp\":1") >= 0) {
+  togglePin(EC_DOWN_PIN, LOW);
+  togglePin(EC_UP_PIN, HIGH);
+  timer.in(PUMP_INTERVAL, disableEC);
+}
+
+if (s.indexOf("\"ECDown\":1") >= 0) {
+  togglePin(EC_UP_PIN, LOW);
+  togglePin(EC_DOWN_PIN, HIGH);
+  timer.in(PUMP_INTERVAL, disableEC);
+}
+
+}
+
+
+ String extractValue(String data, String key) {
+  int start = data.indexOf("\"" + key + "\"");
+  if (start == -1) return "";
+
+  start = data.indexOf(":", start);
+  if (start == -1) return "";
+
+  int firstQuote = data.indexOf("\"", start + 1);
+  int secondQuote = data.indexOf("\"", firstQuote + 1);
+  if (firstQuote == -1 || secondQuote == -1) return "";
+
+  return data.substring(firstQuote + 1, secondQuote);
 }
 
 
